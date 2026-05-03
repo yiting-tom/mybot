@@ -39,6 +39,7 @@ app = typer.Typer(
 RESERVED_COMMANDS = {
     "create", "delete", "list", "agent", "cron", "status",
     "workspace", "provider", "onboard", "set-folder", "daemon",
+    "session",
 }
 
 console = Console()
@@ -744,6 +745,212 @@ def cron_run(
             _print_agent_response(result_holder[0], render_markdown=True)
     else:
         console.print(f"[red]Failed to run job {job_id}[/red]")
+
+
+# ============================================================================
+# Session Commands
+# ============================================================================
+
+session_app = typer.Typer(help="Manage conversation history")
+app.add_typer(session_app, name="session")
+
+
+def _humanize_bytes(n: int) -> str:
+    """Format a byte count as a short human-readable string (e.g. '48.2 KB')."""
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(n)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _format_iso_short(value: str | None) -> str:
+    """Format an ISO timestamp as 'YYYY-MM-DD HH:MM' (or '?' if missing/bad)."""
+    if not value:
+        return "?"
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return value[:16] if len(value) >= 16 else "?"
+
+
+def _format_iso_full(value: str | None) -> str:
+    """Format an ISO timestamp as 'YYYY-MM-DD HH:MM:SS' (or '?' if missing/bad)."""
+    if not value:
+        return "?"
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return value[:19] if len(value) >= 19 else "?"
+
+
+def _bot_label() -> str:
+    """Short label for the active bot (default / named / explicit path)."""
+    from mybot.utils.helpers import DEFAULT_DATA_DIR, get_data_path
+    data_dir = get_data_path()
+    if data_dir == DEFAULT_DATA_DIR:
+        return "(default)"
+    if data_dir.parent == DEFAULT_DATA_DIR / "workspaces":
+        return data_dir.name
+    return str(data_dir)
+
+
+@session_app.command("list")
+def session_list():
+    """List all sessions for the active bot."""
+    from mybot.config.loader import load_config
+    from mybot.session.manager import SessionManager
+
+    config = load_config()
+    manager = SessionManager(config.workspace_path)
+    sessions = manager.list_sessions()
+    label = _bot_label()
+
+    if not sessions:
+        console.print(f"No sessions for bot '{label}'")
+        return
+
+    table = Table(title=f"Sessions for '{label}'")
+    table.add_column("Key", style="cyan")
+    table.add_column("Updated")
+    table.add_column("Messages", justify="right")
+    table.add_column("Size", justify="right")
+
+    for s in sessions:
+        table.add_row(
+            s["key"],
+            _format_iso_short(s.get("updated_at")),
+            str(s.get("message_count", 0)),
+            _humanize_bytes(s.get("size_bytes", 0)),
+        )
+
+    console.print(table)
+
+
+@session_app.command("show")
+def session_show(
+    key: str = typer.Argument(..., help="Session key (e.g. cli:direct, cron:1a2b3c4d)"),
+    max: int = typer.Option(None, "--max", help="Render only the last N messages"),
+):
+    """Render the contents of one session."""
+    import json
+    from collections import deque
+
+    from mybot.config.loader import load_config
+    from mybot.session.manager import SessionManager
+
+    config = load_config()
+    manager = SessionManager(config.workspace_path)
+    path = manager._get_session_path(key)
+    if not path.exists():
+        console.print(f"Session '{key}' not found")
+        raise typer.Exit(1)
+
+    buffer: deque[dict] | None = deque(maxlen=max) if max and max > 0 else None
+    rendered_any = False
+
+    def _render(msg: dict) -> None:
+        nonlocal rendered_any
+        role = msg.get("role", "?")
+        ts = _format_iso_full(msg.get("timestamp"))
+        content = msg.get("content")
+
+        if content is None:
+            content_str = ""
+        elif isinstance(content, list):
+            content_str = json.dumps(content, ensure_ascii=False)
+        else:
+            content_str = str(content)
+
+        if role == "tool" and len(content_str) > 200:
+            content_str = content_str[:200] + "…(truncated)"
+
+        if rendered_any:
+            console.print()
+        console.print(f"[bold]\\[{role} {ts}][/bold]")
+        if content_str:
+            console.print(content_str)
+        rendered_any = True
+
+    with open(path, encoding="utf-8") as f:
+        for i, raw in enumerate(f):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if i == 0 and data.get("_type") == "metadata":
+                continue
+            if data.get("_type") == "metadata":
+                continue
+            if buffer is not None:
+                buffer.append(data)
+            else:
+                _render(data)
+
+    if buffer is not None:
+        for msg in buffer:
+            _render(msg)
+
+
+@session_app.command("clear")
+def session_clear(
+    key: str = typer.Argument(None, help="Session key. Omit when using --all."),
+    all_: bool = typer.Option(False, "--all", help="Clear every session for this bot."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+):
+    """Delete one session or all sessions for the active bot."""
+    from mybot.config.loader import load_config
+    from mybot.session.manager import SessionManager
+
+    if (key is None) == (not all_):
+        console.print("[red]Provide either <key> or --all[/red]")
+        raise typer.Exit(1)
+
+    config = load_config()
+    manager = SessionManager(config.workspace_path)
+
+    if all_:
+        files = sorted(manager.sessions_dir.glob("*.jsonl"))
+        # Top-level only — glob already excludes subdirs by default for *.jsonl,
+        # but filter defensively in case of symlinks.
+        files = [p for p in files if p.is_file()]
+        if not files:
+            console.print("No sessions to clear")
+            return
+        if not yes:
+            console.print(f"[yellow]This will permanently delete {len(files)} session(s).[/yellow]")
+            if not typer.confirm("Continue?"):
+                console.print("Cancelled.")
+                raise typer.Exit()
+        for p in files:
+            try:
+                p.unlink()
+            except OSError:
+                continue
+            session_key = p.stem.replace("_", ":", 1)
+            manager.invalidate(session_key)
+        console.print(f"[green]✓[/green] Cleared {len(files)} session(s)")
+        return
+
+    # Single-key form.
+    path = manager._get_session_path(key)
+    if not path.exists():
+        console.print(f"Session '{key}' not found")
+        raise typer.Exit(1)
+    if not yes:
+        console.print(f"[yellow]This will permanently delete session '{key}'.[/yellow]")
+        if not typer.confirm("Continue?"):
+            console.print("Cancelled.")
+            raise typer.Exit()
+    manager.delete(key)
+    console.print(f"[green]✓[/green] Cleared session '{key}'")
 
 
 # ============================================================================

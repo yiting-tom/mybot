@@ -81,6 +81,24 @@ In interactive mode:
 | `/help` | Show available commands |
 | `exit`, `quit`, `:q`, Ctrl-D | Quit |
 
+To audit, inspect, or prune session history without entering the REPL, use [`mybot <bot> session`](#sessions).
+
+### Sessions
+
+Each bot persists every conversation as a JSONL file under `<workspace_folder>/sessions/`. A new session is created per channel/chat — the interactive REPL uses `cli:direct`, each cron job gets `cron:<id>`, the heartbeat uses `heartbeat`.
+
+```bash
+mybot <name> session list                    # table: key, last updated, message count, size
+mybot <name> session show <key>              # render the conversation (role, timestamp, content)
+mybot <name> session show <key> --max 20     # only the last 20 messages
+mybot <name> session clear <key>             # delete one session (confirms; -y to skip)
+mybot <name> session clear --all             # delete every session for this bot
+```
+
+`/new` (in the REPL) archives the active session into memory. `mybot <bot> session clear` deletes the file outright. They're complementary — use `/new` when you want the agent to remember what was discussed; use `clear` to wipe history that should never have been kept.
+
+`session show` truncates large `tool` messages to 200 characters in the rendered view. The raw JSONL on disk is unchanged.
+
 ## Workspace folders
 
 Each bot has two distinct directories:
@@ -315,6 +333,9 @@ mybot delete <name> [-y]               delete a bot
 mybot <name> set-folder <path|->       change workspace folder
 mybot <name> cron …                    cron management
 mybot <name> daemon [--once|-l FILE]   run cron + heartbeat host
+mybot <name> session list              list sessions
+mybot <name> session show <key>        render a session
+mybot <name> session clear [<key>|--all] [-y]   delete sessions
 mybot <name> agent --logs              chat with debug logs
 mybot status                           show config status
 mybot provider login <name>            OAuth login
@@ -349,7 +370,7 @@ What's kept: the entire agent core (loop, tools, MCP, memory, subagents, skills)
 ## Roadmap
 
 - [x] `mybot daemon` — long-running process to actually fire cron + heartbeat ticks
-- [ ] `mybot session list/show/clear` — manage conversation history from the CLI
+- [x] `mybot session list/show/clear` — manage conversation history from the CLI
 - [ ] `mybot config get/set` — edit config without opening the JSON
 - [ ] `mybot tools list` — show registered tools (incl. MCP-discovered)
 - [ ] Smoke tests

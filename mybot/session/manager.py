@@ -182,31 +182,65 @@ class SessionManager:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
 
+    def delete(self, key: str) -> bool:
+        """Delete a session's JSONL file and drop it from the cache.
+
+        Returns True if a file was actually removed, False otherwise.
+        """
+        path = self._get_session_path(key)
+        existed = path.exists()
+        path.unlink(missing_ok=True)
+        self.invalidate(key)
+        return existed
+
     def list_sessions(self) -> list[dict[str, Any]]:
         """
         List all sessions.
 
         Returns:
-            List of session info dicts.
+            List of session info dicts with: key, created_at, updated_at,
+            path, message_count, size_bytes.
         """
         sessions = []
 
         for path in self.sessions_dir.glob("*.jsonl"):
             try:
-                # Read just the metadata line
+                created_at: str | None = None
+                updated_at: str | None = None
+                key: str | None = None
+                message_count = 0
                 with open(path, encoding="utf-8") as f:
-                    first_line = f.readline().strip()
-                    if first_line:
-                        data = json.loads(first_line)
-                        if data.get("_type") == "metadata":
+                    for i, raw in enumerate(f):
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if i == 0 and data.get("_type") == "metadata":
                             key = data.get("key") or path.stem.replace("_", ":", 1)
-                            sessions.append({
-                                "key": key,
-                                "created_at": data.get("created_at"),
-                                "updated_at": data.get("updated_at"),
-                                "path": str(path)
-                            })
+                            created_at = data.get("created_at")
+                            updated_at = data.get("updated_at")
+                            continue
+                        if data.get("_type") == "metadata":
+                            continue
+                        message_count += 1
+
+                if key is None:
+                    # File without a metadata line — fall back to filename.
+                    key = path.stem.replace("_", ":", 1)
+
+                size_bytes = path.stat().st_size
+                sessions.append({
+                    "key": key,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                    "path": str(path),
+                    "message_count": message_count,
+                    "size_bytes": size_bytes,
+                })
             except Exception:
                 continue
 
-        return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
+        return sorted(sessions, key=lambda x: x.get("updated_at") or "", reverse=True)
