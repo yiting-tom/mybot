@@ -38,7 +38,7 @@ app = typer.Typer(
 # shortcut for bot "foo".
 RESERVED_COMMANDS = {
     "create", "delete", "list", "agent", "cron", "status",
-    "workspace", "provider", "onboard", "set-folder",
+    "workspace", "provider", "onboard", "set-folder", "daemon",
 }
 
 console = Console()
@@ -744,6 +744,341 @@ def cron_run(
             _print_agent_response(result_holder[0], render_markdown=True)
     else:
         console.print(f"[red]Failed to run job {job_id}[/red]")
+
+
+# ============================================================================
+# Daemon Command
+# ============================================================================
+
+
+def _daemon_emit(out: Console, source: str, content: str, *, dim: bool = False) -> None:
+    """Emit one timestamped line: `<YYYY-MM-DD HH:MM:SS> [<source>] <content>`."""
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    body = f"  ↳ {content}" if dim else content
+    line = f"{ts} [{source}]  {body}"
+    out.print(f"[dim]{line}[/dim]" if dim else line)
+
+
+def _acquire_lockfile(data_dir: Path, bot_label: str) -> Path:
+    """Write our PID to <data_dir>/daemon.pid; refuse if a live PID owns it."""
+    lockfile = data_dir / "daemon.pid"
+    if lockfile.exists():
+        try:
+            existing_pid = int(lockfile.read_text().strip())
+        except (ValueError, OSError):
+            existing_pid = 0
+        if existing_pid > 0:
+            try:
+                os.kill(existing_pid, 0)  # 0 = probe, doesn't deliver a signal
+                console.print(
+                    f"[red]Daemon already running for '{bot_label}' (pid {existing_pid})[/red]"
+                )
+                raise typer.Exit(1)
+            except ProcessLookupError:
+                # Stale lockfile — overwrite below.
+                pass
+            except PermissionError:
+                # PID exists but is owned by another user; treat as live.
+                console.print(
+                    f"[red]Daemon already running for '{bot_label}' (pid {existing_pid})[/red]"
+                )
+                raise typer.Exit(1) from None
+
+    lockfile.parent.mkdir(parents=True, exist_ok=True)
+    lockfile.write_text(str(os.getpid()))
+    return lockfile
+
+
+@app.command("daemon")
+def daemon(
+    once: bool = typer.Option(False, "--once", "-1", help="Run every currently-due cron job and exit (skips heartbeat)."),
+    log_file: str = typer.Option(None, "--log-file", "-l", help="Mirror stdout to this file."),
+):
+    """Run cron + heartbeat for the active bot in the foreground."""
+    from loguru import logger
+
+    from mybot.agent.loop import AgentLoop
+    from mybot.bus.queue import MessageBus
+    from mybot.config.loader import get_data_dir, load_config
+    from mybot.cron.service import CronService
+    from mybot.cron.types import CronJob
+    from mybot.heartbeat.service import HeartbeatService
+    from mybot.session.manager import SessionManager
+    from mybot.utils.helpers import DEFAULT_DATA_DIR
+
+    data_dir = get_data_dir()
+    bot_label = (
+        "(default)" if data_dir == DEFAULT_DATA_DIR
+        else data_dir.name if data_dir.parent == DEFAULT_DATA_DIR / "workspaces"
+        else str(data_dir)
+    )
+
+    config = load_config()
+    sync_workspace_templates(config.workspace_path, silent=True)
+
+    # Output sink: stdout + optional tee to log file.
+    if log_file:
+        log_path = Path(log_file).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fp = open(log_path, "a", encoding="utf-8", buffering=1)  # line-buffered
+        out = Console(file=_TeeFile(sys.stdout, log_fp), force_terminal=sys.stdout.isatty())
+    else:
+        log_fp = None
+        out = console
+
+    # Preflight: provider must be constructible (catches missing API key).
+    provider = _make_provider(config)
+
+    # Diagnostic logs are still loguru-gated; daemon output uses Rich directly.
+    logger.disable("mybot")
+
+    if once:
+        asyncio.run(_run_daemon_once(config, provider, out))
+        if log_fp:
+            log_fp.close()
+        return
+
+    lockfile = _acquire_lockfile(data_dir, bot_label)
+
+    bus = MessageBus()
+    session_manager = SessionManager(config.workspace_path)
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
+
+    agent = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        memory_window=config.agents.defaults.memory_window,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
+        brave_api_key=config.tools.web.search.api_key or None,
+        web_proxy=config.tools.web.proxy or None,
+        exec_config=config.tools.exec,
+        cron_service=cron,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+        session_manager=session_manager,
+        mcp_servers=config.tools.mcp_servers,
+    )
+
+    async def on_cron_job(job: CronJob) -> str | None:
+        source = f"cron:{job.id}"
+
+        async def _progress(content: str, *, tool_hint: bool = False) -> None:
+            _daemon_emit(out, source, content, dim=True)
+
+        reminder = (
+            "[Scheduled Task] Timer finished.\n\n"
+            f"Task '{job.name}' has been triggered.\n"
+            f"Scheduled instruction: {job.payload.message}"
+        )
+        response = await agent.process_direct(
+            reminder,
+            session_key=f"cron:{job.id}",
+            channel="cli",
+            chat_id="direct",
+            on_progress=_progress,
+        )
+        if response:
+            _daemon_emit(out, source, response)
+        return response
+
+    cron.on_job = on_cron_job
+
+    async def on_heartbeat_execute(tasks: str) -> str:
+        async def _progress(content: str, *, tool_hint: bool = False) -> None:
+            _daemon_emit(out, "heartbeat", content, dim=True)
+
+        return await agent.process_direct(
+            tasks,
+            session_key="heartbeat",
+            channel="cli",
+            chat_id="direct",
+            on_progress=_progress,
+        )
+
+    async def on_heartbeat_notify(response: str) -> None:
+        if response:
+            _daemon_emit(out, "heartbeat", response)
+
+    hb_cfg = config.gateway.heartbeat
+    heartbeat = HeartbeatService(
+        workspace=config.workspace_path,
+        provider=provider,
+        model=agent.model,
+        on_execute=on_heartbeat_execute,
+        on_notify=on_heartbeat_notify,
+        interval_s=hb_cfg.interval_s,
+        enabled=hb_cfg.enabled,
+    )
+
+    cron_count = cron.status()["jobs"]
+    _daemon_emit(
+        out, "daemon",
+        f"Daemon started for bot '{bot_label}' (cron jobs: {cron_count}, heartbeat: every {hb_cfg.interval_s}s)",
+    )
+
+    asyncio.run(_run_daemon_forever(agent, cron, heartbeat, lockfile, out, log_fp))
+
+
+async def _run_daemon_forever(agent, cron, heartbeat, lockfile: Path, out: Console, log_fp) -> None:
+    """Main daemon coroutine: starts services, awaits SIGINT/SIGTERM, shuts down."""
+    loop = asyncio.get_running_loop()
+    shutdown = asyncio.Event()
+    forced_exit = {"flag": False}
+
+    def _on_signal(signame: str) -> None:
+        if shutdown.is_set():
+            forced_exit["flag"] = True
+            os._exit(1)
+        _daemon_emit(out, "daemon", f"Received {signame}, shutting down...")
+        shutdown.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _on_signal, sig.name)
+
+    agent_task = asyncio.create_task(agent.run())
+
+    try:
+        await cron.start()
+        await heartbeat.start()
+        await shutdown.wait()
+    finally:
+        heartbeat.stop()
+        cron.stop()
+        agent.stop()
+
+        try:
+            await asyncio.wait_for(agent_task, timeout=30.0)
+        except asyncio.TimeoutError:
+            agent_task.cancel()
+            try:
+                await agent_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        try:
+            await agent.close_mcp()
+        except (RuntimeError, BaseExceptionGroup):
+            pass  # MCP SDK cancel-scope cleanup is noisy but harmless
+
+        try:
+            lockfile.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        if log_fp:
+            log_fp.close()
+
+        if not forced_exit["flag"]:
+            _daemon_emit(out, "daemon", "Daemon stopped.")
+
+
+async def _run_daemon_once(config: Config, provider, out: Console) -> None:
+    """`--once` mode: run every cron job whose next_run_at_ms <= now, then exit."""
+    from mybot.agent.loop import AgentLoop
+    from mybot.bus.queue import MessageBus
+    from mybot.config.loader import get_data_dir
+    from mybot.cron.service import CronService, _now_ms, _compute_next_run
+    from mybot.cron.types import CronJob
+
+    bus = MessageBus()
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
+
+    agent = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        memory_window=config.agents.defaults.memory_window,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
+        brave_api_key=config.tools.web.search.api_key or None,
+        web_proxy=config.tools.web.proxy or None,
+        exec_config=config.tools.exec,
+        cron_service=cron,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+        mcp_servers=config.tools.mcp_servers,
+    )
+
+    store = cron._load_store()
+    now = _now_ms()
+    due = [j for j in store.jobs if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms]
+
+    if not due:
+        return
+
+    async def run_one(job: CronJob) -> None:
+        source = f"cron:{job.id}"
+
+        async def _progress(content: str, *, tool_hint: bool = False) -> None:
+            _daemon_emit(out, source, content, dim=True)
+
+        reminder = (
+            "[Scheduled Task] Timer finished.\n\n"
+            f"Task '{job.name}' has been triggered.\n"
+            f"Scheduled instruction: {job.payload.message}"
+        )
+        response = await agent.process_direct(
+            reminder,
+            session_key=f"cron:{job.id}",
+            channel="cli",
+            chat_id="direct",
+            on_progress=_progress,
+        )
+        if response:
+            _daemon_emit(out, source, response)
+        # Advance state.
+        job.state.last_run_at_ms = _now_ms()
+        job.state.last_status = "ok"
+        if job.schedule.kind == "at":
+            if job.delete_after_run:
+                store.jobs = [j for j in store.jobs if j.id != job.id]
+            else:
+                job.enabled = False
+                job.state.next_run_at_ms = None
+        else:
+            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+
+    try:
+        for job in due:
+            await run_one(job)
+        cron._save_store()
+    finally:
+        try:
+            await agent.close_mcp()
+        except (RuntimeError, BaseExceptionGroup):
+            pass
+
+
+class _TeeFile:
+    """Tiny file-like object that writes to two streams (stdout + log file)."""
+
+    def __init__(self, primary, secondary):
+        self._primary = primary
+        self._secondary = secondary
+
+    def write(self, data):
+        self._primary.write(data)
+        self._secondary.write(data)
+        return len(data)
+
+    def flush(self):
+        self._primary.flush()
+        self._secondary.flush()
+
+    def isatty(self):
+        return self._primary.isatty()
+
+    def fileno(self):
+        return self._primary.fileno()
 
 
 # ============================================================================

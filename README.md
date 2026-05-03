@@ -121,13 +121,13 @@ mybot <name> cron remove <id>
 mybot <name> cron enable <id> --disable
 ```
 
-Cron jobs are stored per-bot. They only fire when something is actively running them — see *Heartbeat* below.
+Cron jobs only fire when a daemon is running — see *Running as a daemon* below. Stored per-bot; isolated from other bots' jobs.
 
 The agent itself can also create cron jobs via the `cron` tool when you ask it to ("remind me at 6pm…").
 
 ## Heartbeat (`HEARTBEAT.md`)
 
-Each bot's workspace folder has a `HEARTBEAT.md`. The agent reads it on every heartbeat tick and decides whether there are tasks to run. You can edit it manually or ask the agent to manage it.
+Each bot's workspace folder has a `HEARTBEAT.md`. While the daemon is running, the agent reads it on every heartbeat tick (default every 30 minutes) and decides whether there are tasks to run. You can edit it manually or ask the agent to manage it.
 
 ```markdown
 ## Periodic Tasks
@@ -136,8 +136,99 @@ Each bot's workspace folder has a `HEARTBEAT.md`. The agent reads it on every he
 - [ ] Summarize today's GitHub notifications
 ```
 
-> [!NOTE]
-> The standalone heartbeat/cron daemon (`mybot gateway` in nanobot) is not yet wired up — see roadmap below.
+## Running as a daemon
+
+The cron service and heartbeat both need a host process. `mybot daemon` is that host — a foreground supervisor for one bot.
+
+```bash
+mybot <name> daemon                      # foreground; Ctrl-C to stop
+mybot <name> daemon --once               # run every currently-due cron job and exit (skips heartbeat)
+mybot <name> daemon --log-file ~/log.txt # mirror stdout to a file
+```
+
+Output is timestamped, prefixed by source:
+
+```
+2026-05-03 16:00:00 [daemon]         Daemon started for bot 'work' (cron jobs: 2, heartbeat: every 1800s)
+2026-05-03 16:01:00 [cron:1a2b3c4d]    ↳ web_search("AAPL earnings")
+2026-05-03 16:01:08 [cron:1a2b3c4d]  AAPL reported Q2 EPS of $2.18, above consensus.
+2026-05-03 16:30:00 [heartbeat]      Reviewing HEARTBEAT.md…
+2026-05-03 16:30:09 [heartbeat]      No active tasks.
+```
+
+A PID lockfile at `<data_dir>/daemon.pid` prevents two long-running daemons against the same bot. `--once` doesn't lock — safe to combine with system cron.
+
+### systemd (Linux)
+
+Run one service per bot. Replace `BOT_NAME` and the binary path as needed.
+
+`~/.config/systemd/user/mybot-daemon@.service`:
+
+```ini
+[Unit]
+Description=mybot daemon (%i)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mybot %i daemon
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now mybot-daemon@work
+journalctl --user -u mybot-daemon@work -f
+```
+
+To survive logout: `loginctl enable-linger $USER`.
+
+### launchd (macOS)
+
+`~/Library/LaunchAgents/com.mybot.work.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>             <string>com.mybot.work</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USERNAME/.local/bin/mybot</string>
+    <string>work</string>
+    <string>daemon</string>
+  </array>
+  <key>RunAtLoad</key>         <true/>
+  <key>KeepAlive</key>         <true/>
+  <key>StandardOutPath</key>   <string>/Users/USERNAME/Library/Logs/mybot-work.log</string>
+  <key>StandardErrorPath</key> <string>/Users/USERNAME/Library/Logs/mybot-work.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.mybot.work.plist
+tail -f ~/Library/Logs/mybot-work.log
+launchctl unload ~/Library/LaunchAgents/com.mybot.work.plist
+```
+
+### system cron + `--once`
+
+If you already have OS cron and don't want a long-running process:
+
+```cron
+*/5 * * * * /Users/me/.local/bin/mybot work daemon --once >> ~/.mybot/work.log 2>&1
+```
+
+Related: [`cron list`](#scheduled-tasks-cron) / [`set-folder`](#bot-management).
 
 ## Configuration
 
@@ -223,6 +314,7 @@ mybot list                             list bots
 mybot delete <name> [-y]               delete a bot
 mybot <name> set-folder <path|->       change workspace folder
 mybot <name> cron …                    cron management
+mybot <name> daemon [--once|-l FILE]   run cron + heartbeat host
 mybot <name> agent --logs              chat with debug logs
 mybot status                           show config status
 mybot provider login <name>            OAuth login
@@ -256,7 +348,7 @@ What's kept: the entire agent core (loop, tools, MCP, memory, subagents, skills)
 
 ## Roadmap
 
-- [ ] `mybot daemon` — long-running process to actually fire cron + heartbeat ticks
+- [x] `mybot daemon` — long-running process to actually fire cron + heartbeat ticks
 - [ ] `mybot session list/show/clear` — manage conversation history from the CLI
 - [ ] `mybot config get/set` — edit config without opening the JSON
 - [ ] `mybot tools list` — show registered tools (incl. MCP-discovered)
