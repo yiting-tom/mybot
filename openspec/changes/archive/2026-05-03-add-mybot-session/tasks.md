@@ -61,5 +61,5 @@
 
 - [x] 8.1 `spectra validate add-mybot-session` is clean
 - [x] 8.2 `spectra analyze add-mybot-session` has no Critical/Warning findings
-- [ ] 8.3 Commit + push
+- [x] 8.3 Commit + push
 - [ ] 8.4 `spectra archive add-mybot-session`
