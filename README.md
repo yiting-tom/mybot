@@ -238,6 +238,48 @@ tail -f ~/Library/Logs/mybot-work.log
 launchctl unload ~/Library/LaunchAgents/com.mybot.work.plist
 ```
 
+### Windows (Task Scheduler)
+
+`mybot <name> daemon` runs on Windows 10 / 11 under any console host (PowerShell, Windows Terminal, cmd.exe). Press Ctrl-C to stop.
+
+Caveat: Windows does not deliver SIGTERM to user code, so only Ctrl-C (SIGINT) is wired for graceful shutdown. External supervisors that need an ordered stop must send Ctrl-Break (`CTRL_BREAK_EVENT`) — Python translates it to SIGBREAK — or terminate the process. Send `taskkill /PID <pid>` for an immediate kill.
+
+For periodic execution without a long-running process, use **Task Scheduler** with `--once`:
+
+```powershell
+schtasks /Create /SC MINUTE /MO 5 /TN "mybot-work" `
+  /TR "C:\Python311\Scripts\mybot.exe work daemon --once" /F
+```
+
+Or import a Task Scheduler XML definition:
+
+```xml
+<?xml version="1.0" encoding="UTF-16"?>
+<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT5M</Interval>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Python311\Scripts\mybot.exe</Command>
+      <Arguments>work daemon --once</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+```
+
+Save as `mybot-work.xml` and import:
+
+```powershell
+schtasks /Create /TN "mybot-work" /XML mybot-work.xml
+```
+
 ### system cron + `--once`
 
 If you already have OS cron and don't want a long-running process:

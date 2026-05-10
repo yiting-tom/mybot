@@ -969,28 +969,19 @@ def _daemon_emit(out: Console, source: str, content: str, *, dim: bool = False) 
 
 def _acquire_lockfile(data_dir: Path, bot_label: str) -> Path:
     """Write our PID to <data_dir>/daemon.pid; refuse if a live PID owns it."""
+    from mybot.utils.process import pid_is_alive
+
     lockfile = data_dir / "daemon.pid"
     if lockfile.exists():
         try:
             existing_pid = int(lockfile.read_text().strip())
         except (ValueError, OSError):
             existing_pid = 0
-        if existing_pid > 0:
-            try:
-                os.kill(existing_pid, 0)  # 0 = probe, doesn't deliver a signal
-                console.print(
-                    f"[red]Daemon already running for '{bot_label}' (pid {existing_pid})[/red]"
-                )
-                raise typer.Exit(1)
-            except ProcessLookupError:
-                # Stale lockfile — overwrite below.
-                pass
-            except PermissionError:
-                # PID exists but is owned by another user; treat as live.
-                console.print(
-                    f"[red]Daemon already running for '{bot_label}' (pid {existing_pid})[/red]"
-                )
-                raise typer.Exit(1) from None
+        if existing_pid > 0 and pid_is_alive(existing_pid):
+            console.print(
+                f"[red]Daemon already running for '{bot_label}' (pid {existing_pid})[/red]"
+            )
+            raise typer.Exit(1)
 
     lockfile.parent.mkdir(parents=True, exist_ok=True)
     lockfile.write_text(str(os.getpid()))
@@ -1145,8 +1136,23 @@ async def _run_daemon_forever(agent, cron, heartbeat, lockfile: Path, out: Conso
         _daemon_emit(out, "daemon", f"Received {signame}, shutting down...")
         shutdown.set()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _on_signal, sig.name)
+    if sys.platform == "win32":
+        # Windows asyncio loops don't support add_signal_handler. Bridge the
+        # main-thread signal handler back into the loop via call_soon_threadsafe.
+        # SIGTERM is not delivered to user code on Windows — only SIGINT is wired.
+        def _win_sigint_handler(signum, frame) -> None:
+            if shutdown.is_set():
+                forced_exit["flag"] = True
+                os._exit(1)
+            try:
+                loop.call_soon_threadsafe(_on_signal, "SIGINT")
+            except RuntimeError:
+                pass
+
+        signal.signal(signal.SIGINT, _win_sigint_handler)
+    else:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _on_signal, sig.name)
 
     agent_task = asyncio.create_task(agent.run())
 
