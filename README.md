@@ -393,7 +393,7 @@ mybot/
 ├── session/        💬 Per-bot conversation persistence
 ├── cron/           ⏰ Scheduled jobs
 ├── heartbeat/      💓 Periodic wake-up
-├── bus/            🚌 In-process message routing
+├── bus/            🚌 REPL ↔ agent queue + subagent fan-in
 ├── config/         ⚙️  Pydantic schema + loader
 ├── skills/         🎯 Bundled skills (github, weather, tmux, …)
 ├── templates/      📄 Workspace bootstrap files

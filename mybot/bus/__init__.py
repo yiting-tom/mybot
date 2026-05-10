@@ -1,4 +1,4 @@
-"""Message bus module for decoupled channel-agent communication."""
+"""In-process REPL ↔ agent queue plus subagent fan-in. Per-CLI-invocation, never crosses bots."""
 
 from mybot.bus.events import InboundMessage, OutboundMessage
 from mybot.bus.queue import MessageBus

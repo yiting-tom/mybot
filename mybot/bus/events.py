@@ -1,22 +1,28 @@
-"""Event types for the message bus."""
+"""Message types for the in-process REPL ↔ agent queue and subagent fan-in.
+
+Channel values are constrained to a small `Literal`:
+
+- `cli`: REPL stdin push, single-shot CLI, cron, heartbeat — anything driven by the user or scheduler.
+- `system`: subagent fan-in announcements injected so the main agent loop summarizes them for the user.
+
+Re-introducing chat-platform routing (Telegram, Discord, etc.) is explicitly out of scope.
+"""
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Literal
 
 
 @dataclass
 class InboundMessage:
-    """Message received from a chat channel."""
+    """A message arriving at `AgentLoop.run()` — either from REPL stdin or a subagent fan-in."""
 
-    channel: str  # routing tag (e.g. "cli", "system")
-    sender_id: str  # User identifier
-    chat_id: str  # Chat/channel identifier
-    content: str  # Message text
+    channel: Literal["cli", "system"]
+    sender_id: str
+    chat_id: str
+    content: str
     timestamp: datetime = field(default_factory=datetime.now)
-    media: list[str] = field(default_factory=list)  # Media URLs
-    metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
-    session_key_override: str | None = None  # Optional override for thread-scoped sessions
+    session_key_override: str | None = None
 
     @property
     def session_key(self) -> str:
@@ -26,13 +32,15 @@ class InboundMessage:
 
 @dataclass
 class OutboundMessage:
-    """Message to send to a chat channel."""
+    """A response published by the agent core for the REPL renderer to consume.
 
-    channel: str
+    `is_progress` lets the renderer distinguish intermediate progress hints (rendered as
+    dimmed `↳ ...` lines) from final responses. `is_tool_hint` differentiates tool-call
+    progress notes from free-form progress text.
+    """
+
+    channel: Literal["cli", "system"]
     chat_id: str
     content: str
-    reply_to: str | None = None
-    media: list[str] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
+    is_progress: bool = False
+    is_tool_hint: bool = False

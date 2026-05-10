@@ -1,6 +1,11 @@
-"""Message tool for sending messages to users."""
+"""Message tool for sending messages to users.
 
-from typing import Any, Awaitable, Callable
+`media` and `message_id` parameters were carried over from nanobot's chat-platform routing.
+mybot only delivers OutboundMessage to the REPL renderer in-process, so neither value has
+a consumer — both have been dropped from the tool schema and the OutboundMessage shape.
+"""
+
+from typing import Any, Awaitable, Callable, Literal
 
 from mybot.agent.tools.base import Tool
 from mybot.bus.events import OutboundMessage
@@ -12,21 +17,18 @@ class MessageTool(Tool):
     def __init__(
         self,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
-        default_channel: str = "",
+        default_channel: Literal["cli", "system"] | str = "",
         default_chat_id: str = "",
-        default_message_id: str | None = None,
     ):
         self._send_callback = send_callback
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
-        self._default_message_id = default_message_id
         self._sent_in_turn: bool = False
 
-    def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def set_context(self, channel: str, chat_id: str) -> None:
         """Set the current message context."""
         self._default_channel = channel
         self._default_chat_id = chat_id
-        self._default_message_id = message_id
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -53,11 +55,6 @@ class MessageTool(Tool):
                     "type": "string",
                     "description": "The message content to send"
                 },
-                "media": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional: list of file paths to attach (images, audio, documents)"
-                }
             },
             "required": ["content"]
         }
@@ -67,13 +64,10 @@ class MessageTool(Tool):
         content: str,
         channel: str | None = None,
         chat_id: str | None = None,
-        message_id: str | None = None,
-        media: list[str] | None = None,
         **kwargs: Any
     ) -> str:
         channel = channel or self._default_channel
         chat_id = chat_id or self._default_chat_id
-        message_id = message_id or self._default_message_id
 
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
@@ -81,21 +75,19 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
+        if channel not in ("cli", "system"):
+            return f"Error: Invalid channel '{channel}' (must be 'cli' or 'system')"
+
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
             content=content,
-            media=media or [],
-            metadata={
-                "message_id": message_id,
-            }
         )
 
         try:
             await self._send_callback(msg)
             if channel == self._default_channel and chat_id == self._default_chat_id:
                 self._sent_in_turn = True
-            media_info = f" with {len(media)} attachments" if media else ""
-            return f"Message sent to {channel}:{chat_id}{media_info}"
+            return f"Message sent to {channel}:{chat_id}"
         except Exception as e:
             return f"Error sending message: {str(e)}"
